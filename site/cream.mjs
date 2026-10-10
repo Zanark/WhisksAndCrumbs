@@ -1,10 +1,217 @@
 export const CREAM_FRAME_INTERVAL = 1000 / 30;
 export const CREAM_PIXEL_BUDGET = 2_000_000;
 export const CREAM_MOTION_MULTIPLIER = 2;
+export const CREAM_GEOMETRY_MULTIPLIER = 2;
+export const CREAM_MAX_GROUPS = 9;
+export const CREAM_MAX_DROPLETS = 8;
+export const CREAM_MAX_SPAWNS = 8;
+export const CREAM_MAX_PRIMITIVES = 48;
+export const CREAM_TRAIL_LENGTH = .99;
+export const CREAM_SPAWN_BASE_RADIUS = .075;
+export const CREAM_EDGE_PROFILE = Object.freeze({
+  largeFraction: .14, glassMaxWidth: 1344, glassGutter: 32,
+  wideFrom: 1200, wideIntrusion: 32, narrowIntrusion: 16,
+});
 export const CURSOR_SHAPE_PROFILE = Object.freeze({ minStretch: 1.08, maxStretch: 1.38, maxExtent: 1.51 });
 
 const TAU = Math.PI * 2;
 const wrapPhase = angle => ((angle % TAU) + TAU) % TAU;
+
+export function createProductionRecipe(model, seed) {
+  const base = model.createSceneRecipe(seed);
+  if (model.CLUMP_PROFILES.some(profile => profile.length > 3)) throw new RangeError('Production groups support at most three lobes.');
+  const groupCount = Math.ceil(base.groupCount * 1.5), extras = [];
+  for (let index = 0; index < groupCount - base.groupCount; index++) {
+    const original = base.clumps[2 + index % (base.groupCount - 2)];
+    const side = index % 2 ? 'right' : 'left';
+    extras.push(Object.freeze({ ...original, side, x: side === 'left' ? .16 : .84,
+      y: .13 + ((original.y + .37 * (index + 1)) % .74) }));
+  }
+  // Append, rather than insert, so every original group's and droplet's motion index is unchanged.
+  const clumps = Object.freeze([...base.clumps, ...extras]), edgeGroups = [];
+  clumps.forEach((group, parent) => {
+    if (group.kind === 'group' && group.radius >= CREAM_EDGE_PROFILE.largeFraction) {
+      edgeGroups.push(Object.freeze({ parent, side: edgeGroups.length % 2 ? 'right' : 'left' }));
+    }
+  });
+  return Object.freeze({ ...base, baseGroupCount: base.groupCount, groupCount, clumps,
+    edgeGroups: Object.freeze(edgeGroups) });
+}
+
+export function productionEdgeLayout(model, recipe, width, height) {
+  if (![width, height].every(value => Number.isFinite(value) && value > 0)) {
+    throw new RangeError('Positive viewport dimensions are required for cream edge placement.');
+  }
+  const unit = Math.min(width, height), profile = CREAM_EDGE_PROFILE;
+  const glassWidth = Math.min(profile.glassMaxWidth, Math.max(0, width - profile.glassGutter));
+  const glassLeft = (width - glassWidth) / 2, glassRight = width - glassLeft;
+  const intrusion = width >= profile.wideFrom ? profile.wideIntrusion : profile.narrowIntrusion;
+  const leftLimit = glassLeft + intrusion, rightLimit = glassRight - intrusion;
+  const sideLobes = { left: 0, right: 0 };
+  for (const entry of recipe.edgeGroups) {
+    sideLobes[entry.side] += model.CLUMP_PROFILES[recipe.clumps[entry.parent].clump].length;
+  }
+  const groups = recipe.edgeGroups.map(({ parent, side }) => {
+    const seed = recipe.clumps[parent], lobes = model.CLUMP_PROFILES[seed.clump];
+    const edges = lobes.map(([x, , radius], lobe) => {
+      const values = [x - radius, x + radius], motion = seed.lobeMotion;
+      if (motion?.mode === 'divergent' && motion.lobe === lobe) {
+        const detachedX = Math.cos(motion.angle) * motion.reach;
+        values.push(detachedX - motion.detachedRadius, detachedX + motion.detachedRadius);
+      }
+      return { min: Math.min(...values), max: Math.max(...values) };
+    });
+    // Both offset and radius interpolate linearly during peeling; extrema are at the two endpoints.
+    const phase = Math.sin(parent * 2.399963), breathMax = 1 + .025 * (1 - phase);
+    const breathMin = 1 - .025 * (1 + phase), radius = seed.radius * unit * CREAM_GEOMETRY_MULTIPLIER;
+    const leftOffsets = edges.map(edge => edge.min * radius * (edge.min < 0 ? breathMax : breathMin));
+    const rightOffsets = edges.map(edge => edge.max * radius * (edge.max > 0 ? breathMax : breathMin));
+    const minOffset = Math.min(...leftOffsets), maxOffset = Math.max(...rightOffsets);
+    const orbit = seed.orbit[0] * unit;
+    const blend = unit * .040;
+    // Projected distance bounds retain lobe separation, avoiding excessive padding that hides edge artwork.
+    const projectedLeft = leftOffsets.reduce((a, b) => model.smoothUnion(a, b, blend));
+    const projectedRight = rightOffsets.reduce((a, b) => -model.smoothUnion(-a, -b, blend));
+    const otherUnionMargin = Math.max(0, sideLobes[side] - lobes.length) * blend / 4;
+    const unionMargin = Math.max(minOffset - projectedLeft, projectedRight - maxOffset) + otherUnionMargin;
+    // Original shadow is displaced +6px; fwidth AA needs at most 4 CSS pixels at the minimum .5 scale.
+    const shadowLeft = Math.max(4, unit * .034 - 6), shadowRight = Math.max(4, unit * .034 + 6);
+    const minX = seed.x * width - orbit + minOffset - unionMargin - shadowLeft;
+    const maxX = seed.x * width + orbit + maxOffset + unionMargin + shadowRight;
+    const translationX = side === 'left' ? leftLimit - maxX : rightLimit - minX;
+    return { parent, side, translationX, envelopeMinX: minX + translationX,
+      envelopeMaxX: maxX + translationX, unionMargin, otherUnionMargin, shadowLeft, shadowRight, orbit, breathMin, breathMax };
+  });
+  return { glassLeft, glassRight, intrusion, leftLimit, rightLimit, groups };
+}
+
+export function sampleProductionScene(model, recipe, width, height, seconds, spawns = []) {
+  if (!Array.isArray(spawns) || spawns.length > CREAM_MAX_SPAWNS) throw new RangeError('At most eight strawberry spawns are supported.');
+  const sampled = model.sampleScoops(model.seedScoops(width, height, recipe), seconds, width, height);
+  const edgeLayout = productionEdgeLayout(model, recipe, width, height);
+  const translations = new Map(edgeLayout.groups.map(group => [group.parent, group.translationX]));
+  const main = [], attached = [];
+  sampled.forEach((scoop, parent) => {
+    // Expand one validated group at a time: the immutable study's aggregate capacity is deliberately smaller.
+    for (const primitive of model.expandScoops([{ ...scoop, x: scoop.x + (translations.get(parent) || 0),
+      radius: scoop.radius * CREAM_GEOMETRY_MULTIPLIER }])) {
+      (primitive.lobe === 0 ? main : attached).push({ ...primitive, parent });
+    }
+  });
+  const primitives = [...main, ...attached], ambientCount = primitives.length;
+  spawns.forEach((spawn, index) => {
+    validateSpawn(spawn);
+    const age = Math.max(0, seconds - spawn.born), phase = wrapPhase(spawn.id * 2.399963);
+    const unit = Math.min(width, height);
+    const x = spawn.x * width + unit * .012 * (Math.sin(phase + age * .31) - Math.sin(phase));
+    const y = spawn.y * height + unit * .009 * (Math.sin(phase + age * .23) - Math.sin(phase));
+    primitives.push({ x: Math.max(0, Math.min(width, x)), y: Math.max(0, Math.min(height, y)),
+      radius: unit * CREAM_SPAWN_BASE_RADIUS * CREAM_GEOMETRY_MULTIPLIER *
+        (1 + .022 * (Math.sin(phase + age * model.MOTION_PROFILE.breathRate) - Math.sin(phase))),
+      peak: 0, parent: sampled.length + index, lobe: 0, spawnId: spawn.id });
+  });
+  if (primitives.length > CREAM_MAX_PRIMITIVES) throw new RangeError('Production cream primitive capacity exceeded.');
+  return { primitives, ambientCount, strawberryStart: spawns.length ? ambientCount : -1 };
+}
+
+function validateSpawn(spawn) {
+  if (!spawn || !Number.isSafeInteger(spawn.id) || spawn.id < 1 ||
+      ![spawn.x, spawn.y, spawn.born].every(Number.isFinite) ||
+      spawn.x < 0 || spawn.x > 1 || spawn.y < 0 || spawn.y > 1 || spawn.born < 0) {
+    throw new RangeError('A positive spawn identity, normalized position and nonnegative birth time are required.');
+  }
+}
+
+export function appendCreamSpawn(spawns, spawn) {
+  if (!Array.isArray(spawns) || spawns.length > CREAM_MAX_SPAWNS) throw new RangeError('A bounded spawn queue is required.');
+  spawns.forEach(validateSpawn);
+  validateSpawn(spawn);
+  return Object.freeze([...spawns.slice(-(CREAM_MAX_SPAWNS - 1)), Object.freeze({ ...spawn })]);
+}
+
+export function sampleProductionTrail(model, trail, cursor) {
+  return model.sampleTrail(trail, cursor).map(point => ({
+    x: cursor.x + (point.x - cursor.x) * CREAM_TRAIL_LENGTH / model.TRAIL_PROFILE.lengthScale,
+    y: cursor.y + (point.y - cursor.y) * CREAM_TRAIL_LENGTH / model.TRAIL_PROFILE.lengthScale,
+  }));
+}
+
+function ambientDistance(model, primitives, point, blend) {
+  let distance = 100000;
+  for (const p of primitives) distance = model.smoothUnion(distance, Math.hypot(point.x-p.x, point.y-p.y)-p.radius, blend);
+  return distance;
+}
+
+export function creamFieldDistances(model, primitives, cursor, shape, path, width, height, point) {
+  const radius = model.cursorRadius(width, height), blend = Math.min(width, height) * .04;
+  const warped = cursorShapePoint((point.x-cursor.x)/radius, (point.y-cursor.y)/radius, shape);
+  const head = Math.hypot(warped.x, warped.y)*radius-radius;
+  let tail = 100000, lead = cursor;
+  path.forEach((end, index) => {
+    const dx = end.x-lead.x, dy = end.y-lead.y, lengthSquared = dx*dx+dy*dy;
+    if (lengthSquared >= .25) {
+      const t = Math.max(0, Math.min(1, ((point.x-lead.x)*dx+(point.y-lead.y)*dy)/lengthSquared));
+      const progress = (index+t)/model.TRAIL_PROFILE.links;
+      const r = radius*(model.TRAIL_PROFILE.startRadius+(model.TRAIL_PROFILE.endRadius-model.TRAIL_PROFILE.startRadius)*progress);
+      tail = Math.min(tail, Math.hypot(point.x-lead.x-t*dx, point.y-lead.y-t*dy)-r);
+    }
+    lead = end;
+  });
+  const background = ambientDistance(model, primitives, point, blend), tailBlend = Math.min(blend*.4, radius*.4);
+  return { background, head, tail, cursor: model.smoothUnion(head, tail, tailBlend),
+    shared: model.smoothUnion(model.smoothUnion(background, head, blend), tail, tailBlend) };
+}
+
+export function creamContactState(model, primitives, cursor, shape, path, width, height) {
+  const radius = model.cursorRadius(width, height), blend = Math.min(width, height)*.04;
+  const tailBlend = Math.min(blend*.4, radius*.4);
+  let head = false, tail = false;
+  const candidates = primitives.map((p, index) => ({ p, index })).filter(({ p }) =>
+    Math.hypot(cursor.x-p.x, cursor.y-p.y) < p.radius+radius*CURSOR_SHAPE_PROFILE.maxExtent+blend*2);
+  if (candidates.length) {
+    for (let i = 0; i < 32 && !head; i++) {
+      const angle = i*TAU/32, x = Math.cos(angle), y = Math.sin(angle), q = cursorShapePoint(x, y, shape);
+      const reach = radius/Math.hypot(q.x, q.y);
+      head = ambientDistance(model, primitives, { x: cursor.x+x*reach, y: cursor.y+y*reach }, blend) < blend+.5;
+    }
+  }
+  let lead = cursor;
+  path.forEach((end, index) => {
+    const dx = end.x-lead.x, dy = end.y-lead.y, lengthSquared = dx*dx+dy*dy;
+    if (!tail && lengthSquared >= .25) {
+      for (const p of primitives) {
+        const t = Math.max(0, Math.min(1, ((p.x-lead.x)*dx+(p.y-lead.y)*dy)/lengthSquared));
+        const widest = radius*(model.TRAIL_PROFILE.startRadius+
+          (model.TRAIL_PROFILE.endRadius-model.TRAIL_PROFILE.startRadius)*index/model.TRAIL_PROFILE.links);
+        if (Math.hypot(p.x-lead.x-t*dx, p.y-lead.y-t*dy) > p.radius+widest+blend+tailBlend+.5) continue;
+        for (const fraction of [0, t, .5, 1]) {
+          const point = { x: lead.x+fraction*dx, y: lead.y+fraction*dy };
+          const r = radius*(model.TRAIL_PROFILE.startRadius+
+            (model.TRAIL_PROFILE.endRadius-model.TRAIL_PROFILE.startRadius)*(index+fraction)/model.TRAIL_PROFILE.links);
+          if (ambientDistance(model, primitives, point, blend) < r+tailBlend+.5) { tail = true; break; }
+        }
+        if (tail) break;
+      }
+    }
+    lead = end;
+  });
+  return { active: head || tail, head, tail };
+}
+
+function excludedCreamTarget(event) {
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+  return path.some(node => node?.isContentEditable ||
+    node?.closest?.('dialog, [data-open-notebook], a[data-photo], #cream-motion-control, #bakery-entrance, input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]'));
+}
+
+export function creamClickAllowed(event, gesture, now) {
+  return !!(gesture && gesture.valid && gesture.released && event.isTrusted === true &&
+    event.button === 0 && event.detail > 0 && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey &&
+    Number.isFinite(now) && now >= gesture.ended && now - gesture.ended < 750 &&
+    Number.isFinite(event.clientX) && Number.isFinite(event.clientY) &&
+    Math.hypot(event.clientX - gesture.x, event.clientY - gesture.y) <= 10 &&
+    (!event.pointerType || event.pointerType === gesture.type) && !excludedCreamTarget(event));
+}
 
 export function createCursorShape() {
   return { angle: 0, stretch: 1.13, phase: 0, energy: 0, velocityX: 0, velocityY: 0 };
@@ -112,14 +319,15 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
   if (!gl) throw new Error('WebGL2 is unavailable.');
   const pointerContext = pointerCanvas.getContext('2d');
   if (!pointerContext) console.warn('The optional cream cursor is unavailable; retaining the native pointer.');
-  const shaders = [];
+  const shaders = [], programs = [], materials = [];
   let program, geometry, uniforms, limit, viewport;
   const dispose = () => {
     if (geometry) gl.deleteBuffer(geometry);
-    if (program) gl.deleteProgram(program);
+    programs.forEach(value => gl.deleteProgram(value));
     shaders.forEach(shader => gl.deleteShader(shader));
     geometry = program = undefined;
     shaders.length = 0;
+    programs.length = materials.length = 0;
   };
   const compile = (kind, source) => {
     const shader = gl.createShader(kind);
@@ -133,29 +341,34 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
     gl.attachShader(program, shader);
   };
   try {
-    program = gl.createProgram();
-    if (!program) throw new Error('Cream program allocation failed.');
-    compile(gl.VERTEX_SHADER, sources.vertex);
-    compile(gl.FRAGMENT_SHADER, sources.fragment);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(`Cream shader link failed: ${gl.getProgramInfoLog(program)}`);
+    for (const [index, fragment] of [sources.fragment, sources.strawberryFragment, sources.contactFragment].entries()) {
+      program = gl.createProgram();
+      if (!program) throw new Error('Cream program allocation failed.');
+      programs.push(program);
+      compile(gl.VERTEX_SHADER, sources.vertex);
+      compile(gl.FRAGMENT_SHADER, fragment);
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(`Cream shader link failed: ${gl.getProgramInfoLog(program)}`);
+      }
+      shaders.forEach(shader => { gl.detachShader(program, shader); gl.deleteShader(shader); });
+      shaders.length = 0;
+      const position = gl.getAttribLocation(program, 'position');
+      if (position < 0) throw new Error('Cream vertex position is unavailable.');
+      const names = ['resolution', 'pixelRatio', 'viewSize', 'scoopCount', 'scoops',
+        'trail', 'trailCount', 'headRadius', 'cursorTint', 'cursorShape'];
+      if (index >= 1) names.push('strawberryStart');
+      if (index === 2) names.push('ambientCount', 'contactActive', 'contactPass', 'contactTrailCount', 'contactShape');
+      uniforms = Object.fromEntries(names.map(name =>
+        [name, gl.getUniformLocation(program, ['scoops', 'trail'].includes(name) ? `${name}[0]` : name)]));
+      if (Object.values(uniforms).some(value => value === null)) throw new Error('Cream material uniforms are unavailable.');
+      materials.push({ program, position, uniforms: { ambientCount: null, contactActive: null,
+        contactPass: null, contactTrailCount: null, contactShape: null, strawberryStart: null, ...uniforms } });
     }
-    shaders.forEach(shader => { gl.detachShader(program, shader); gl.deleteShader(shader); });
-    shaders.length = 0;
-    gl.useProgram(program);
     geometry = gl.createBuffer();
     if (!geometry) throw new Error('Cream geometry allocation failed.');
     gl.bindBuffer(gl.ARRAY_BUFFER, geometry);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    const position = gl.getAttribLocation(program, 'position');
-    if (position < 0) throw new Error('Cream vertex position is unavailable.');
-    gl.enableVertexAttribArray(position);
-    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
-    uniforms = Object.fromEntries(['resolution', 'pixelRatio', 'viewSize', 'scoopCount', 'scoops',
-      'trail', 'trailCount', 'headRadius', 'cursorTint', 'cursorShape'].map(name =>
-      [name, gl.getUniformLocation(program, ['scoops', 'trail'].includes(name) ? `${name}[0]` : name)]));
-    if (Object.values(uniforms).some(value => value === null)) throw new Error('Cream material uniforms are unavailable.');
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
     gl.disable(gl.SCISSOR_TEST);
@@ -166,30 +379,55 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
     dispose();
     throw error;
   }
-  const data = new Float32Array(model.MAX_PRIMITIVES * 4);
-  const pointerData = new Float32Array(model.MAX_PRIMITIVES * 4);
+  const data = new Float32Array(CREAM_MAX_PRIMITIVES * 4);
+  const pointerData = new Float32Array(CREAM_MAX_PRIMITIVES * 4);
+  const contactData = new Float32Array(CREAM_MAX_PRIMITIVES * 4);
   const trailData = new Float32Array(model.TRAIL_PROFILE.links * 4);
   return {
     dispose,
     outputSize(width, height, ratio) { return creamOutputSize(width, height, ratio, limit, viewport); },
-    draw({ width, height, output, primitives, cursor, shape, trail, pointerActive }) {
+    draw({ width, height, output, primitives, strawberryStart, cursor, shape, trail, pointerActive }) {
       if (gl.isContextLost()) throw new Error('Cream graphics context was lost during rendering.');
       gl.viewport(0, 0, canvas.width, canvas.height);
-      gl.useProgram(program);
-      gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
-      gl.uniform1f(uniforms.pixelRatio, output.ratio);
-      gl.uniform2f(uniforms.viewSize, width, height);
-      const radius = model.cursorRadius(width, height), path = model.sampleTrail(trail, cursor);
+      const radius = model.cursorRadius(width, height), path = sampleProductionTrail(model, trail, cursor);
+      const canPaintPointer = pointerActive && pointerContext && !pointerContext.isContextLost?.();
+      const contact = canPaintPointer ? creamContactState(model, primitives, cursor, shape, path, width, height)
+        : { active: false, head: false, tail: false };
+      const count = primitives.length + (contact.active ? 1 : 0);
+      if (count > CREAM_MAX_PRIMITIVES) throw new Error('Cream contact exceeds primitive capacity.');
+      data.fill(0);
+      primitives.forEach((scoop, index) => data.set([scoop.x, scoop.y, scoop.radius, scoop.peak], index * 4));
+      if (contact.active) {
+        contactData.set(data);
+        contactData.set([cursor.x, cursor.y, radius, 0], primitives.length * 4);
+      }
       let lead = cursor, segments = 0, pointerPainted = false;
       path.forEach((point, index) => {
         trailData.set([lead.x, lead.y, point.x, point.y], index * 4);
         if (Math.hypot(point.x - lead.x, point.y - lead.y) >= .5) segments++;
         lead = point;
       });
-      gl.uniform4fv(uniforms.trail, trailData);
-      gl.uniform1f(uniforms.headRadius, radius);
-      if (pointerActive && pointerContext && !pointerContext.isContextLost?.()) {
-        const margin = radius * CURSOR_SHAPE_PROFILE.maxExtent + 14 + Math.min(width, height) * .04, points = [cursor, ...path];
+      let selected = -1;
+      const select = index => {
+        if (selected === index) return;
+        selected = index;
+        const material = materials[index];
+        uniforms = material.uniforms;
+        gl.useProgram(material.program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, geometry);
+        gl.enableVertexAttribArray(material.position);
+        gl.vertexAttribPointer(material.position, 2, gl.FLOAT, false, 0, 0);
+        gl.uniform2f(uniforms.resolution, canvas.width, canvas.height);
+        gl.uniform1f(uniforms.pixelRatio, output.ratio);
+        gl.uniform2f(uniforms.viewSize, width, height);
+        gl.uniform4fv(uniforms.trail, trailData);
+        gl.uniform1f(uniforms.headRadius, radius);
+      };
+      const margin = radius * CURSOR_SHAPE_PROFILE.maxExtent + 14 + Math.min(width, height) * .04 +
+        (contact.active ? Math.min(width, height)*.034 + 4 : 0);
+      if (canPaintPointer) {
+        select(contact.active ? 2 : 0);
+        const points = [cursor, ...path];
         const left = Math.max(0, Math.floor((Math.min(...points.map(point => point.x)) - margin) * output.ratio));
         const top = Math.max(0, Math.floor((Math.min(...points.map(point => point.y)) - margin) * output.ratio));
         const right = Math.min(canvas.width, Math.ceil((Math.max(...points.map(point => point.x)) + margin) * output.ratio));
@@ -202,12 +440,20 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
             width: `${cropWidth / output.ratio}px`, height: `${cropHeight / output.ratio}px` });
           pointerData.fill(0);
           pointerData.set([cursor.x, cursor.y, radius, 0]);
-          gl.uniform1i(uniforms.scoopCount, 1);
-          gl.uniform4fv(uniforms.scoops, pointerData);
-          gl.uniform1i(uniforms.trailCount, trail.length);
-          gl.uniform1f(uniforms.cursorTint, 1);
-          gl.uniform4f(uniforms.cursorShape, shape.angle, shape.stretch, shape.phase, shape.energy);
-          // The small transparent cursor pass is copied above content; the full canvas stays ivory-only.
+          gl.uniform1i(uniforms.scoopCount, contact.active ? count : 1);
+          gl.uniform4fv(uniforms.scoops, contact.active ? contactData : pointerData);
+          gl.uniform1i(uniforms.trailCount, contact.active ? 0 : trail.length);
+          gl.uniform1f(uniforms.cursorTint, contact.active ? 0 : 1);
+          gl.uniform1i(uniforms.strawberryStart, contact.active ? strawberryStart : -1);
+          if (contact.active) {
+            gl.uniform4f(uniforms.cursorShape, 0, 1, 0, 0);
+            gl.uniform1i(uniforms.ambientCount, primitives.length);
+            gl.uniform1i(uniforms.contactActive, 1);
+            gl.uniform1i(uniforms.contactPass, 1);
+            gl.uniform1i(uniforms.contactTrailCount, trail.length);
+            gl.uniform4f(uniforms.contactShape, shape.angle, shape.stretch, shape.phase, shape.energy);
+          } else gl.uniform4f(uniforms.cursorShape, shape.angle, shape.stretch, shape.phase, shape.energy);
+          // Shared-field foreground contains only the cursor/neck contribution, never the ambient crop.
           gl.enable(gl.SCISSOR_TEST);
           gl.scissor(left, canvas.height - bottom, cropWidth, cropHeight);
           try {
@@ -222,17 +468,22 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
           }
         }
       }
-      data.fill(0);
-      primitives.forEach((scoop, index) => data.set([scoop.x, scoop.y, scoop.radius, scoop.peak], index * 4));
-      gl.uniform1i(uniforms.scoopCount, primitives.length);
-      gl.uniform4fv(uniforms.scoops, data);
+      select(contact.active ? 2 : strawberryStart >= 0 ? 1 : 0);
+      gl.uniform1i(uniforms.scoopCount, count);
+      gl.uniform4fv(uniforms.scoops, contact.active ? contactData : data);
       gl.uniform1i(uniforms.trailCount, 0);
       gl.uniform1f(uniforms.cursorTint, 0);
+      gl.uniform1i(uniforms.strawberryStart, strawberryStart);
       gl.uniform4f(uniforms.cursorShape, 0, 1, 0, 0);
+      gl.uniform1i(uniforms.contactActive, contact.active ? 1 : 0);
+      gl.uniform1i(uniforms.contactPass, 0);
+      gl.uniform1i(uniforms.ambientCount, primitives.length);
+      gl.uniform1i(uniforms.contactTrailCount, contact.active ? trail.length : 0);
+      if (contact.active) gl.uniform4f(uniforms.contactShape, shape.angle, shape.stretch, shape.phase, shape.energy);
       gl.disable(gl.SCISSOR_TEST);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       if (gl.getError() !== gl.NO_ERROR) throw new Error('Cream material rendering failed.');
-      return { pointerPainted, segments, radius };
+      return { pointerPainted, segments, radius, contact, primitiveCount: count, margin };
     },
   };
 }
@@ -257,12 +508,13 @@ async function initialize(layer, model) {
   const body = document.body;
   const revision = new URL(import.meta.url).searchParams.get('v') || 'unversioned';
   let renderer, sources, recipe, output, frame, heartbeat, overlays, controlsObserver, stylesObserver;
-  let width = 0, height = 0, ratio = 0, scoops = [], paintCount = 0, motionTime = 0, lastTime = 0;
-  let lastPaintTime = 0, clampedTime = 0;
+  let width = 0, height = 0, ratio = 0, paintCount = 0, motionTime = 0, lastTime = 0;
+  let lastPaintTime = 0, clampedTime = 0, lastContact = false;
   let paused = false, lost = false, failed = false, disposed = false, pageHidden = false, printEvent = false;
   let blurred = !document.hasFocus(), pointerPresent = false, dirty = true, refreshing = false;
   let cursor = { x: 0, y: 0 }, target = { ...cursor }, trail;
   let cursorShape = createCursorShape();
+  let spawns = [], spawnSequence = 0, gesture;
   const events = new AbortController();
   const motion = matchMedia('(prefers-reduced-motion: reduce)');
   const forced = matchMedia('(forced-colors: active)');
@@ -290,12 +542,14 @@ async function initialize(layer, model) {
     nativePointer();
   };
   const hide = reason => {
+    if (lastContact) dirty = true;
     stop();
     pointerPresent = false;
+    gesture = undefined;
     layer.hidden = true;
     if (control) control.hidden = true;
     body.classList.remove('has-cream-effects');
-    setData({ state: reason, paused });
+    setData({ state: reason, paused, contactActive: false, contactHead: false, contactTrail: false });
   };
   const fail = error => {
     failed = true;
@@ -342,26 +596,34 @@ async function initialize(layer, model) {
       trail = model.resetTrail(cursor);
     }
     width = nextWidth; height = nextHeight; ratio = nextRatio; output = next;
-    scoops = model.seedScoops(width, height, recipe);
     canvas.width = output.width; canvas.height = output.height;
     dirty = true;
     nativePointer();
+    const edgeLayout = productionEdgeLayout(model, recipe, width, height);
     setData({ pixelRatio: output.ratio, outputWidth: output.width, outputHeight: output.height,
-      outputPixels: output.width * output.height, viewportWidth: width, viewportHeight: height });
+      outputPixels: output.width * output.height, viewportWidth: width, viewportHeight: height,
+      largeGroupCount: edgeLayout.groups.length, largeEdgeGroups: JSON.stringify(edgeLayout.groups),
+      edgeIntrusionLimit: edgeLayout.intrusion, edgeLeftLimit: edgeLayout.leftLimit, edgeRightLimit: edgeLayout.rightLimit });
   };
   const render = animate => {
     const sampleTime = creamSampleTime(motionTime);
-    const primitives = model.expandScoops(model.sampleScoops(scoops, sampleTime, width, height));
-    const painted = renderer.draw({ width, height, output, primitives, cursor, shape: cursorShape, trail,
+    const scene = sampleProductionScene(model, recipe, width, height, sampleTime, spawns);
+    const painted = renderer.draw({ width, height, output, ...scene, cursor, shape: cursorShape, trail,
       pointerActive: animate && pointerFocused() && pointerPresent });
+    lastContact = painted.contact.active;
     // Never hide the native cursor before both GPU passes and the overlay copy succeed.
     pointerCanvas.hidden = !painted.pointerPainted;
     body.classList.toggle('cream-cursor-active', painted.pointerPainted);
     if (painted.pointerPainted) pointerCanvas.dataset.paintCount = String(Number(pointerCanvas.dataset.paintCount || 0) + 1);
     lastPaintTime = performance.now();
     setData({ paintCount: ++paintCount, motionTime: motionTime.toFixed(4), sampleTime: sampleTime.toFixed(6),
-      lastPaintTime: lastPaintTime.toFixed(2), clampedTime: clampedTime.toFixed(4), primitiveCount: primitives.length,
+      lastPaintTime: lastPaintTime.toFixed(2), clampedTime: clampedTime.toFixed(4), primitiveCount: painted.primitiveCount,
+      scenePrimitiveCount: scene.primitives.length, contactActive: painted.contact.active,
+      contactHead: painted.contact.head, contactTrail: painted.contact.tail, pointerCropMargin: painted.margin.toFixed(4),
+      ambientPrimitiveCount: scene.ambientCount, strawberryStart: scene.strawberryStart,
+      spawnCount: spawns.length, spawnRecords: JSON.stringify(spawns), scoopCount: recipe.clumps.length + spawns.length,
       cursorRadius: painted.radius.toFixed(3), cursorX: cursor.x.toFixed(4), cursorY: cursor.y.toFixed(4),
+      pointerPose: JSON.stringify({ x: cursor.x, y: cursor.y, shape: cursorShape }),
       cursorAngle: cursorShape.angle.toFixed(6), cursorStretch: cursorShape.stretch.toFixed(6),
       cursorPhase: cursorShape.phase.toFixed(6), cursorEnergy: cursorShape.energy.toFixed(6),
       trailSegments: painted.segments, pointerActive: painted.pointerPainted });
@@ -422,6 +684,7 @@ async function initialize(layer, model) {
       if (button.textContent !== label) button.textContent = label;
       // The normal-flow footer control must fit its column, but need not be in the viewport.
       if (!controlFits()) { hide('control-fit'); return; }
+      if (lastContact && !state.animate) dirty = true;
       if (dirty) render(false);
       body.classList.add('has-cream-effects');
       setData({ state: state.animate ? (lastTime ? layer.dataset.state : 'scheduled') : state.reason, paused });
@@ -451,7 +714,8 @@ async function initialize(layer, model) {
     renderer = undefined;
   };
   setData({ state: 'initializing', revision, paintCount: 0, motionTime: '0.0000', sampleTime: '0.000000',
-    motionMultiplier: CREAM_MOTION_MULTIPLIER, lastPaintTime: 0, clampedTime: '0.0000', paused: false, error: '' });
+    motionMultiplier: CREAM_MOTION_MULTIPLIER, lastPaintTime: 0, clampedTime: '0.0000', paused: false, error: '',
+    contactActive: false, contactHead: false, contactTrail: false, scenePrimitiveCount: 0 });
   try {
     if (!canvas || !pointerCanvas || !control || !button) throw new Error('Cream enhancement markup is incomplete.');
     if (!model || !['createSceneRecipe', 'seedScoops', 'sampleScoops', 'expandScoops', 'followPointer',
@@ -460,13 +724,16 @@ async function initialize(layer, model) {
     }
     if (!stylesReady()) throw new Error('Cream styles are unavailable.');
     const material = await import(creamModuleUrl('./cream-material.mjs'));
-    sources = material.createCreamShaders(model);
+    sources = material.createCreamShaders({ ...model, MAX_PRIMITIVES: CREAM_MAX_PRIMITIVES });
     const seed = globalThis.crypto?.getRandomValues
       ? crypto.getRandomValues(new Uint32Array(1))[0] : Math.floor(Math.random() * 4294967296);
-    recipe = model.createSceneRecipe(seed);
-    setData({ sceneSeed: seed, groupCount: recipe.groupCount, dropletCount: recipe.dropletCount,
+    recipe = createProductionRecipe(model, seed);
+    setData({ sceneSeed: seed, groupCount: recipe.groupCount, baseGroupCount: recipe.baseGroupCount, dropletCount: recipe.dropletCount,
       scoopCount: recipe.clumps.length, seedCount: recipe.clumps.length,
-      capacity: model.MAX_PRIMITIVES, primitiveCapacity: model.MAX_PRIMITIVES, logicalCapacity: model.MAX_SCOOPS });
+      capacity: CREAM_MAX_PRIMITIVES, primitiveCapacity: CREAM_MAX_PRIMITIVES,
+      logicalCapacity: CREAM_MAX_GROUPS + CREAM_MAX_DROPLETS + CREAM_MAX_SPAWNS,
+      geometryMultiplier: CREAM_GEOMETRY_MULTIPLIER, trailLengthScale: CREAM_TRAIL_LENGTH,
+      spawnCapacity: CREAM_MAX_SPAWNS, spawnBaseRadiusFraction: CREAM_SPAWN_BASE_RADIUS });
     button.setAttribute('aria-keyshortcuts', 'Alt+Shift+P');
     button.setAttribute('title', 'Pause or resume cream motion (Alt+Shift+P)');
     on(button, 'click', togglePause);
@@ -475,20 +742,56 @@ async function initialize(layer, model) {
       event.preventDefault();
       togglePause();
     });
-    on(window, 'pointermove', event => {
+    const updatePointer = event => {
       recoverFocus();
-      if (!lifecycle().animate || !pointerFocused() || event.pointerType !== 'mouse' || event.buttons) {
+      if (!lifecycle().animate || !pointerFocused() || event.pointerType !== 'mouse' || (event.buttons & ~1) ||
+          (event.type === 'pointerup' && event.button !== 0)) {
         pointerPresent = false; nativePointer(); refresh(); return;
       }
       target = { x: event.clientX, y: event.clientY };
       if (!pointerPresent) { cursor = { ...target }; trail = model.resetTrail(cursor); }
       pointerPresent = target.x >= 0 && target.y >= 0 && target.x < innerWidth && target.y < innerHeight;
       refresh();
+    };
+    const trackGesture = event => {
+      if (gesture && event.pointerId === gesture.pointerId &&
+          Math.hypot(event.clientX - gesture.x, event.clientY - gesture.y) > 10) gesture.valid = false;
+    };
+    on(window, 'pointermove', event => {
+      trackGesture(event);
+      updatePointer(event);
     }, { passive: true });
-    on(window, 'pointerdown', () => { recoverFocus(); pointerPresent = false; nativePointer(); refresh(); }, { passive: true });
+    on(window, 'pointerdown', event => {
+      gesture = event.isTrusted === true && event.isPrimary !== false && event.button === 0 &&
+        ['mouse', 'touch', 'pen'].includes(event.pointerType) && !event.altKey && !event.ctrlKey &&
+        !event.metaKey && !event.shiftKey && lifecycle().animate && !viewerOpen() && !excludedCreamTarget(event)
+        ? { pointerId: event.pointerId, type: event.pointerType, x: event.clientX, y: event.clientY,
+          began: performance.now(), valid: true, released: false } : undefined;
+      updatePointer(event);
+    }, { passive: true });
+    on(window, 'pointerup', event => {
+      trackGesture(event);
+      if (gesture && event.pointerId === gesture.pointerId) {
+        gesture.ended = performance.now();
+        gesture.released = true;
+        if (gesture.type !== 'mouse' && gesture.ended - gesture.began > 700) gesture.valid = false;
+      }
+      updatePointer(event);
+    }, { passive: true });
+    on(window, 'click', event => {
+      const candidate = gesture;
+      gesture = undefined;
+      if (!renderer || !lifecycle().animate || viewerOpen() || !creamClickAllowed(event, candidate, performance.now())) return;
+      if (event.clientX < 0 || event.clientY < 0 || event.clientX >= innerWidth || event.clientY >= innerHeight) return;
+      spawns = appendCreamSpawn(spawns, { id: ++spawnSequence, x: event.clientX / innerWidth,
+        y: event.clientY / innerHeight, born: creamSampleTime(motionTime) });
+      // A normal animation frame paints the queue; a synchronous inactive repaint would erase the follower.
+      schedule();
+    }, { passive: true });
     on(document.documentElement, 'pointerleave', () => { pointerPresent = false; nativePointer(); }, { passive: true });
-    on(window, 'pointercancel', () => { pointerPresent = false; nativePointer(); }, { passive: true });
-    on(window, 'blur', () => { blurred = true; pointerPresent = false; nativePointer(); refresh(); });
+    on(window, 'pointercancel', () => { gesture = undefined; pointerPresent = false; nativePointer(); }, { passive: true });
+    on(window, 'contextmenu', () => { gesture = undefined; pointerPresent = false; nativePointer(); }, { passive: true });
+    on(window, 'blur', () => { gesture = undefined; blurred = true; pointerPresent = false; nativePointer(); refresh(); });
     on(window, 'focus', () => { recoverFocus(); refresh(); });
     on(document, 'focusin', () => { recoverFocus(); refresh(); });
     on(window, 'pagehide', () => { pageHidden = true; hide('page-hidden'); });

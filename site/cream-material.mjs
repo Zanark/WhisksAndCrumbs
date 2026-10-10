@@ -119,5 +119,98 @@ void main(){
   color=vec4(clamp(cream,0.,1.)*coverage,alpha);
 }
 `;
-  return { vertex, fragment };
+  // Keep the classic fragment byte-identical: even inactive tint branches can change GPU rounding.
+  const strawberryField = `float strawberryWeight(vec2 p,float aa){
+  float ivoryDistance=100000.,pinkDistance=100000.;
+  float blend=min(viewSize.x,viewSize.y)*.040;
+  for(int i=0;i<${MAX_PRIMITIVES};i++){
+    if(i>=scoopCount)break;
+    float distance=length(p-scoops[i].xy)-scoops[i].z;
+    if(i<strawberryStart)ivoryDistance=merge(ivoryDistance,distance,blend);
+    else pinkDistance=merge(pinkDistance,distance,blend);
+  }
+  // A newly placed strawberry stays pink even inside a larger ivory group.
+  return max(1.-smoothstep(-aa,aa,pinkDistance),smoothstep(-blend,blend,ivoryDistance-pinkDistance));
+}
+`;
+  const strawberryFragment = fragment
+    .replace('uniform vec4 cursorShape;', 'uniform vec4 cursorShape;\nuniform int strawberryStart;')
+    .replace('float surface(vec2 p){', `${strawberryField}float surface(vec2 p){`)
+    .replace('  vec3 cream=ivory*', `  if(strawberryStart>=0){
+    ivory=mix(ivory,vec3(255.,224.,234.)/255.,strawberryWeight(p,aa));
+  }
+  vec3 cream=ivory*`);
+  const contactFields = `vec4 contactSurfaces(vec2 p){
+  float background=100000.,head=100000.,ivoryDistance=100000.,pinkDistance=100000.;
+  float blend=min(viewSize.x,viewSize.y)*.040;
+  for(int i=0;i<${MAX_PRIMITIVES};i++){
+    if(i>=scoopCount)break;
+    vec4 s=scoops[i];
+    if(i<ambientCount){
+      float distance=length(p-s.xy)-s.z;
+      background=merge(background,distance,blend);
+      if(strawberryStart>=0){
+        if(i<strawberryStart)ivoryDistance=merge(ivoryDistance,distance,blend);
+        else pinkDistance=merge(pinkDistance,distance,blend);
+      }
+    }else{
+      head=length((cursorTint>.5||contactActive>0)?cursorWarp(p-s.xy,s.z):p-s.xy)-s.z;
+    }
+  }
+  float shared=merge(background,head,blend);
+  shared=merge(shared,tailSurface(p).x,min(blend*.4,headRadius*.4));
+  return vec4(shared,background,ivoryDistance,pinkDistance);
+}
+float cursorSurface(vec2 p){
+  vec4 head=scoops[scoopCount-1];
+  float d=length(cursorWarp(p-head.xy,head.z))-head.z;
+  return merge(d,tailSurface(p).x,min(min(viewSize.x,viewSize.y)*.016,headRadius*.4));
+}
+`;
+  const originalSurface = fragment.slice(fragment.indexOf('float surface(vec2 p){'), fragment.indexOf('float creamHeight('));
+  const contactFragment = fragment
+    .replace(originalSurface, contactFields)
+    .replace('uniform vec4 cursorShape;', `uniform vec4 cursorShape;
+uniform int strawberryStart;
+uniform int ambientCount;
+uniform int contactActive;
+uniform int contactPass;
+uniform int contactTrailCount;
+uniform vec4 contactShape;`)
+    .replace('if(i>=trailCount)break;', 'if(i>=(contactActive>0?contactTrailCount:trailCount))break;')
+    .replace('  float c=cos(cursorShape.x),s=sin(cursorShape.x);', `  vec4 shape=contactActive>0?contactShape:cursorShape;
+  float c=cos(shape.x),s=sin(shape.x);`)
+    .replaceAll('cursorShape.y', 'shape.y')
+    .replaceAll('cursorShape.z', 'shape.z')
+    .replaceAll('cursorShape.w', 'shape.w')
+    .replaceAll('cursorTint>.5&&i==scoopCount-1', '(cursorTint>.5||contactActive>0)&&i==scoopCount-1')
+    .replace('  float d=surface(p);', '  vec4 fields=contactSurfaces(p);\n  float d=fields.x;')
+    .replace('  float shadowDistance=surface(p-vec2(6.,11.));',
+      '  vec4 shadowFields=contactSurfaces(p-vec2(6.,11.));\n  float shadowDistance=shadowFields.x;')
+    .replace(`  if(cursorTint>.5){
+    float follower=d;
+    float strawberry=1.-smoothstep(-aa,aa,follower);
+    ivory=mix(ivory,vec3(255.,224.,234.)/255.,strawberry);
+  }`, `  float background=fields.y,own=cursorSurface(p),blend=scale*.040;
+  float softCursor=1.-smoothstep(-headRadius*.65,0.,own);
+  float strawberry=max(softCursor,smoothstep(-blend,blend,background-own));
+  if(strawberryStart>=0)strawberry=max(strawberry,max(1.-smoothstep(-aa,aa,fields.w),smoothstep(-blend,blend,fields.z-fields.w)));
+  if(cursorTint>.5||contactActive>0)ivory=mix(ivory,vec3(255.,224.,234.)/255.,strawberry);`)
+    .replace('  float alpha=1.-(1.-shadow)*(1.-coverage);', `  if(contactActive>0){
+    float baseAA=max(fwidth(background),.55);
+    float baseCoverage=1.-smoothstep(-baseAA,baseAA,background);
+    float baseShadow=(1.-smoothstep(-5.,scale*.034,shadowFields.y))*(1.-baseCoverage)*.10;
+    if(contactPass==1){
+      float added=clamp((coverage-baseCoverage)/max(1.-baseCoverage,.00001),0.,1.);
+      float neck=clamp((background-d)/max(aa,.5),0.,1.)*(1.-smoothstep(0.,blend,-background));
+      float addedShadow=clamp((shadow-baseShadow)/max(1.-baseShadow,.00001),0.,1.);
+      coverage=max(added,baseCoverage*max(softCursor,neck));
+      shadow=addedShadow;
+    }else{
+      coverage=baseCoverage;
+      shadow=baseShadow;
+    }
+  }
+  float alpha=1.-(1.-shadow)*(1.-coverage);`);
+  return { vertex, fragment, strawberryFragment, contactFragment };
 }
