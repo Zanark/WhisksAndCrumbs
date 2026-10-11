@@ -173,10 +173,13 @@ The strawberry shape gently changes even at rest, becoming a soft oval or
 organic blob and stretching smoothly in the direction of movement.
 The longer trail and follower softly join nearby cream blobs and pull apart as
 you move away. This is a visual effect, not a physics simulation.
-Background groups and individual blobs are twice their earlier size, while the
-cursor head keeps its size. There are more groups, with the largest kept near
-the outer edges rather than across the reading column.
-Click or tap the page to leave a large strawberry blob. The newest eight stay;
+Grouped blobs have smaller pieces, with a further reduction for the largest
+groups. Their members gently pull apart and drift back together on independent,
+varied cycles.
+Individual background blobs and the cursor head keep their sizes.
+The largest groups remain near the outer edges rather than across the reading column.
+Click or tap the page to leave a smaller strawberry blob, with a different soft
+shape on each click. The newest eight stay;
 another click replaces the oldest, and reloading starts a fresh scene.
 Ordinary mouse clicks keep the follower visible. Navigation and photo controls
 still work normally, and touch scrolling does not leave accidental blobs.

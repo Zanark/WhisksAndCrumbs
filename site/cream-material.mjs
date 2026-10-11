@@ -212,5 +212,33 @@ uniform vec4 contactShape;`)
     }
   }
   float alpha=1.-(1.-shadow)*(1.-coverage);`);
-  return { vertex, fragment, strawberryFragment, contactFragment };
+  const spawnFields = `bool spawnIndex(int i){
+  return strawberryStart>=0&&i>=strawberryStart&&i<strawberryStart+spawnShapeCount;
+}
+vec2 spawnLocal(vec2 delta,float radius,int i){
+  vec4 shape=spawnShapes[i-strawberryStart];
+  float c=cos(shape.x),s=sin(shape.x);
+  vec2 q=vec2(c*delta.x+s*delta.y,-s*delta.x+c*delta.y)/radius;
+  q.y/=shape.y;
+  if(dot(q,q)<.0000000001)return q;
+  float theta=atan(q.y,q.x),a=shape.w==1.?.10:.015;
+  float b=shape.w==0.?.035:.055,d=shape.w==2.?.10:.025;
+  float radial=.94*(1.+a*cos(theta+shape.z)+b*cos(2.*theta-shape.z)+d*sin(3.*theta+2.*shape.z))/(1.+a+b+d);
+  return q/radial;
+}
+float spawnDistance(int i,vec2 p,vec4 scoop){
+  if(spawnIndex(i))return (length(spawnLocal(p-scoop.xy,scoop.z,i))-1.)*scoop.z;
+  return length(p-scoop.xy)-scoop.z;
+}
+`;
+  const withSpawnShapes = source => source
+    .replace('uniform int strawberryStart;', 'uniform int strawberryStart;\nuniform int spawnShapeCount;\nuniform vec4 spawnShapes[8];')
+    .replace('float merge(', `${spawnFields}float merge(`)
+    .replace('else d=merge(d,length(p-s.xy)-s.z,blend);', 'else d=merge(d,spawnDistance(i,p,s),blend);')
+    .replace('float distance=length(p-scoops[i].xy)-scoops[i].z;', 'float distance=spawnDistance(i,p,scoops[i]);')
+    .replace('float distance=length(p-s.xy)-s.z;', 'float distance=spawnDistance(i,p,s);')
+    .replace('    vec2 q=(p-s.xy)/s.z;', '    vec2 q=(p-s.xy)/s.z;\n    if(spawnIndex(i))q=spawnLocal(p-s.xy,s.z,i);');
+  const spawnFragment = withSpawnShapes(strawberryFragment);
+  const spawnContactFragment = withSpawnShapes(contactFragment);
+  return { vertex, fragment, strawberryFragment, contactFragment, spawnFragment, spawnContactFragment };
 }

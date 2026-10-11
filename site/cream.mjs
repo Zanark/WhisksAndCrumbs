@@ -2,12 +2,17 @@ export const CREAM_FRAME_INTERVAL = 1000 / 30;
 export const CREAM_PIXEL_BUDGET = 2_000_000;
 export const CREAM_MOTION_MULTIPLIER = 2;
 export const CREAM_GEOMETRY_MULTIPLIER = 2;
+export const GROUP_GEOMETRY_MULTIPLIER = CREAM_GEOMETRY_MULTIPLIER / 1.5;
+export const LARGE_GROUP_GEOMETRY_MULTIPLIER = GROUP_GEOMETRY_MULTIPLIER / 2;
+export const GROUP_MOTION_PROFILE = Object.freeze({ cycles: 8, gapFraction: .042, maxGapFraction: .044 });
 export const CREAM_MAX_GROUPS = 9;
 export const CREAM_MAX_DROPLETS = 8;
 export const CREAM_MAX_SPAWNS = 8;
 export const CREAM_MAX_PRIMITIVES = 48;
 export const CREAM_TRAIL_LENGTH = .99;
 export const CREAM_SPAWN_BASE_RADIUS = .075;
+export const SPAWN_GEOMETRY_MULTIPLIER = 1;
+export const SPAWN_SHAPE_PROFILE = Object.freeze({ extent: .94, minAspect: .70, maxAspect: .84 });
 export const CREAM_EDGE_PROFILE = Object.freeze({
   largeFraction: .14, glassMaxWidth: 1344, glassGutter: 32,
   wideFrom: 1200, wideIntrusion: 32, narrowIntrusion: 16,
@@ -16,6 +21,117 @@ export const CURSOR_SHAPE_PROFILE = Object.freeze({ minStretch: 1.08, maxStretch
 
 const TAU = Math.PI * 2;
 const wrapPhase = angle => ((angle % TAU) + TAU) % TAU;
+
+function compactGroupOffsets(lobes, centre, gap, turn) {
+  const count = lobes.length, masses = lobes.map(lobe => lobe[2] ** 2);
+  const mass = masses.reduce((sum, value) => sum + value, 0);
+  const distance = (i, j) => Math.max(Math.hypot(lobes[i][0] - lobes[j][0], lobes[i][1] - lobes[j][1]),
+    lobes[i][2] + lobes[j][2] + gap);
+  const first = distance(0, 1), target = [[0, 0], [first, 0]];
+  if (count === 3) {
+    const a = distance(0, 2), b = distance(1, 2), x = (first * first + a * a - b * b) / (2 * first);
+    const sign = Math.sign((lobes[1][0] - lobes[0][0]) * (lobes[2][1] - lobes[0][1]) -
+      (lobes[1][1] - lobes[0][1]) * (lobes[2][0] - lobes[0][0]));
+    target.push([x, sign * Math.sqrt(Math.max(0, a * a - x * x))]);
+  }
+  const mean = [0, 1].map(axis => target.reduce((sum, point, i) => sum + point[axis] * masses[i], 0) / mass);
+  const centred = target.map(point => [point[0] - mean[0], point[1] - mean[1]]);
+  let dot = 0, cross = 0;
+  centred.forEach(([x, y], i) => {
+    const dx = lobes[i][0] - centre[0], dy = lobes[i][1] - centre[1];
+    dot += masses[i] * (x * dx + y * dy);
+    cross += masses[i] * (x * dy - y * dx);
+  });
+  const angle = Math.atan2(cross, dot) + turn, c = Math.cos(angle), s = Math.sin(angle);
+  const aligned = centred.map(([x, y]) => [c * x - s * y, s * x + c * y]);
+  const constraints = [];
+  const add = (axes, bound) => {
+    const average = [0, 1].map(axis => axes.reduce((sum, vector) => sum + vector[axis], 0) / mass);
+    const direction = axes.map((vector, i) => [vector[0] / masses[i] - average[0], vector[1] / masses[i] - average[1]]);
+    const norm = axes.reduce((sum, vector, i) => sum + vector[0] * direction[i][0] + vector[1] * direction[i][1], 0);
+    constraints.push({ axes, direction, norm, bound, correction: 0 });
+  };
+  for (let i = 0; i < count; i++) for (let j = i + 1; j < count; j++) {
+    const original = [lobes[i][0] - lobes[j][0], lobes[i][1] - lobes[j][1]];
+    for (const [vector, separate] of [[[aligned[i][0] - aligned[j][0], aligned[i][1] - aligned[j][1]], true], [original, false]]) {
+      const length = Math.hypot(...vector), axes = Array.from({ length: count }, () => [0, 0]);
+      axes[i] = vector.map(value => value / length);
+      axes[j] = axes[i].map(value => -value);
+      add(axes, separate ? lobes[i][2] + lobes[j][2] + gap - axes[i][0] * original[0] - axes[i][1] * original[1] : 0);
+    }
+  }
+  for (let i = 0; i < count; i++) {
+    const vector = [lobes[i][0] - centre[0], lobes[i][1] - centre[1]], length = Math.hypot(...vector);
+    const axes = Array.from({ length: count }, () => [0, 0]);
+    axes[i] = vector.map(value => value / length);
+    add(axes, .011);
+  }
+  // Precompute minimum-displacement separation, rather than dilating every member by the worst pair's reach.
+  // Weighted projections preserve the anchor; extra half-planes keep every member outward and every pair monotonic.
+  const offsets = Array.from({ length: count }, () => [0, 0]);
+  for (let iteration = 0; iteration < 256; iteration++) {
+    let change = 0;
+    for (const constraint of constraints) {
+      const value = constraint.axes.reduce((sum, axis, i) => sum + axis[0] * offsets[i][0] + axis[1] * offsets[i][1], 0);
+      const correction = Math.max(0, (constraint.bound - value - constraint.correction * constraint.norm) / constraint.norm);
+      const step = constraint.correction + correction;
+      offsets.forEach((offset, i) => {
+        offset[0] += step * constraint.direction[i][0];
+        offset[1] += step * constraint.direction[i][1];
+      });
+      change = Math.max(change, Math.abs(step));
+      constraint.correction = -correction;
+    }
+    if (change < 1e-13) break;
+  }
+  return Object.freeze(offsets.map(offset => Object.freeze(offset)));
+}
+
+function createGroupMotion(model, seed, group, parent) {
+  let state = (seed ^ Math.imul(parent + 1, 0x9e3779b9)) >>> 0;
+  const random = () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = Math.imul(state ^ state >>> 15, state | 1);
+    value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+    return ((value ^ value >>> 14) >>> 0) / 4294967296;
+  };
+  const lobes = Object.freeze(model.CLUMP_PROFILES[group.clump].map(([x, y, radius]) => Object.freeze([x, y, radius])));
+  const mass = lobes.reduce((sum, lobe) => sum + lobe[2] ** 2, 0);
+  const centre = Object.freeze([0, 1].map(axis => lobes.reduce((sum, lobe) => sum + lobe[axis] * lobe[2] ** 2, 0) / mass));
+  const breathMin = 1 - .025 * (1 + Math.sin(parent * 2.399963));
+  const geometryMultiplier = group.radius >= CREAM_EDGE_PROFILE.largeFraction ?
+    LARGE_GROUP_GEOMETRY_MULTIPLIER : GROUP_GEOMETRY_MULTIPLIER;
+  let duration = 0;
+  const cycles = Object.freeze(Array.from({ length: GROUP_MOTION_PROFILE.cycles }, () => {
+    const period = 16 + random() * 12, joined = .16 + random() * .10, held = .12 + random() * .08;
+    const gap = (GROUP_MOTION_PROFILE.gapFraction + random() * (GROUP_MOTION_PROFILE.maxGapFraction - GROUP_MOTION_PROFILE.gapFraction)) /
+      (group.radius * geometryMultiplier * breathMin);
+    const offsets = compactGroupOffsets(lobes, centre, gap, (random() - .5) * .12);
+    const cycle = Object.freeze({ start: duration, period, joined, held, offsets });
+    duration += period;
+    return cycle;
+  }));
+  return Object.freeze({ lobes, centre, geometryMultiplier, cycles, duration, offset: random() * cycles[0].period * .12 });
+}
+
+export function sampleGroupMotion(motion, seconds) {
+  if (!motion || !Array.isArray(motion.cycles) || !Number.isFinite(seconds) || seconds < 0) {
+    throw new RangeError('A production group motion recipe and nonnegative finite time are required.');
+  }
+  const time = (seconds + motion.offset) % motion.duration;
+  const index = motion.cycles.findIndex(cycle => time < cycle.start + cycle.period);
+  const cycle = motion.cycles[index], phase = (time - cycle.start) / cycle.period;
+  const ramp = (1 - cycle.joined - cycle.held) / 2;
+  let fraction, stage;
+  if (phase <= cycle.joined) { fraction = 0; stage = 'joined'; }
+  else if (phase < cycle.joined + ramp) { fraction = (phase - cycle.joined) / ramp; stage = 'repelling'; }
+  else if (phase <= cycle.joined + ramp + cycle.held) { fraction = 1; stage = 'separated'; }
+  else { fraction = (1 - phase) / ramp; stage = 'attracting'; }
+  const amount = fraction * fraction * fraction * (10 + fraction * (-15 + fraction * 6));
+  const lobeState = motion.lobes.map(([x, y, radius], lobe) =>
+    [x + cycle.offsets[lobe][0] * amount, y + cycle.offsets[lobe][1] * amount, radius]);
+  return { cycle: index, phase, amount, stage, lobeState };
+}
 
 export function createProductionRecipe(model, seed) {
   const base = model.createSceneRecipe(seed);
@@ -34,7 +150,9 @@ export function createProductionRecipe(model, seed) {
       edgeGroups.push(Object.freeze({ parent, side: edgeGroups.length % 2 ? 'right' : 'left' }));
     }
   });
-  return Object.freeze({ ...base, baseGroupCount: base.groupCount, groupCount, clumps,
+  const groupMotions = Object.freeze(clumps.map((group, parent) =>
+    group.kind === 'group' ? createGroupMotion(model, seed, group, parent) : null));
+  return Object.freeze({ ...base, baseGroupCount: base.groupCount, groupCount, clumps, groupMotions,
     edgeGroups: Object.freeze(edgeGroups) });
 }
 
@@ -52,18 +170,15 @@ export function productionEdgeLayout(model, recipe, width, height) {
     sideLobes[entry.side] += model.CLUMP_PROFILES[recipe.clumps[entry.parent].clump].length;
   }
   const groups = recipe.edgeGroups.map(({ parent, side }) => {
-    const seed = recipe.clumps[parent], lobes = model.CLUMP_PROFILES[seed.clump];
+    const seed = recipe.clumps[parent], lobes = model.CLUMP_PROFILES[seed.clump], motion = recipe.groupMotions[parent];
     const edges = lobes.map(([x, , radius], lobe) => {
-      const values = [x - radius, x + radius], motion = seed.lobeMotion;
-      if (motion?.mode === 'divergent' && motion.lobe === lobe) {
-        const detachedX = Math.cos(motion.angle) * motion.reach;
-        values.push(detachedX - motion.detachedRadius, detachedX + motion.detachedRadius);
-      }
+      const values = [x - radius, x + radius];
+      for (const cycle of motion.cycles) values.push(x + cycle.offsets[lobe][0] - radius, x + cycle.offsets[lobe][0] + radius);
       return { min: Math.min(...values), max: Math.max(...values) };
     });
-    // Both offset and radius interpolate linearly during peeling; extrema are at the two endpoints.
+    // Every seeded cycle interpolates between these exact endpoints; piece radii never shrink.
     const phase = Math.sin(parent * 2.399963), breathMax = 1 + .025 * (1 - phase);
-    const breathMin = 1 - .025 * (1 + phase), radius = seed.radius * unit * CREAM_GEOMETRY_MULTIPLIER;
+    const breathMin = 1 - .025 * (1 + phase), radius = seed.radius * unit * motion.geometryMultiplier;
     const leftOffsets = edges.map(edge => edge.min * radius * (edge.min < 0 ? breathMax : breathMin));
     const rightOffsets = edges.map(edge => edge.max * radius * (edge.max > 0 ? breathMax : breathMin));
     const minOffset = Math.min(...leftOffsets), maxOffset = Math.max(...rightOffsets);
@@ -92,9 +207,11 @@ export function sampleProductionScene(model, recipe, width, height, seconds, spa
   const translations = new Map(edgeLayout.groups.map(group => [group.parent, group.translationX]));
   const main = [], attached = [];
   sampled.forEach((scoop, parent) => {
+    const group = scoop.kind === 'group';
+    const lobeState = group ? sampleGroupMotion(recipe.groupMotions[parent], seconds).lobeState : scoop.lobeState;
     // Expand one validated group at a time: the immutable study's aggregate capacity is deliberately smaller.
     for (const primitive of model.expandScoops([{ ...scoop, x: scoop.x + (translations.get(parent) || 0),
-      radius: scoop.radius * CREAM_GEOMETRY_MULTIPLIER }])) {
+      lobeState, radius: scoop.radius * (group ? recipe.groupMotions[parent].geometryMultiplier : CREAM_GEOMETRY_MULTIPLIER) }])) {
       (primitive.lobe === 0 ? main : attached).push({ ...primitive, parent });
     }
   });
@@ -106,12 +223,60 @@ export function sampleProductionScene(model, recipe, width, height, seconds, spa
     const x = spawn.x * width + unit * .012 * (Math.sin(phase + age * .31) - Math.sin(phase));
     const y = spawn.y * height + unit * .009 * (Math.sin(phase + age * .23) - Math.sin(phase));
     primitives.push({ x: Math.max(0, Math.min(width, x)), y: Math.max(0, Math.min(height, y)),
-      radius: unit * CREAM_SPAWN_BASE_RADIUS * CREAM_GEOMETRY_MULTIPLIER *
+      radius: unit * CREAM_SPAWN_BASE_RADIUS * SPAWN_GEOMETRY_MULTIPLIER *
         (1 + .022 * (Math.sin(phase + age * model.MOTION_PROFILE.breathRate) - Math.sin(phase))),
-      peak: 0, parent: sampled.length + index, lobe: 0, spawnId: spawn.id });
+      peak: 0, parent: sampled.length + index, lobe: 0, spawnId: spawn.id,
+      spawnShape: spawn.shape ?? createSpawnShape(recipe.seed, spawn.id) });
   });
   if (primitives.length > CREAM_MAX_PRIMITIVES) throw new RangeError('Production cream primitive capacity exceeded.');
   return { primitives, ambientCount, strawberryStart: spawns.length ? ambientCount : -1 };
+}
+
+export function createSpawnShape(seed, id) {
+  if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff || !Number.isSafeInteger(id) || id < 1) {
+    throw new RangeError('An unsigned scene seed and positive safe spawn identity are required.');
+  }
+  let state = (seed ^ Math.imul(id >>> 0, 0x85ebca6b) ^ Math.imul(Math.floor(id / 0x100000000), 0xc2b2ae35)) >>> 0;
+  const random = () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = Math.imul(state ^ state >>> 15, state | 1);
+    value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+    return ((value ^ value >>> 14) >>> 0) / 4294967296;
+  };
+  return Object.freeze({ angle: random() * TAU, aspect: .70 + random() * .14,
+    phase: random() * TAU, kind: Math.floor(random() * 3) });
+}
+
+function validateSpawnShape(shape) {
+  // GPU-read descriptors may round a valid endpoint by one Float32 unit.
+  if (!shape || ![shape.angle, shape.aspect, shape.phase].every(Number.isFinite) ||
+      shape.angle < 0 || shape.angle > Math.fround(TAU) || shape.phase < 0 || shape.phase > Math.fround(TAU) ||
+      shape.aspect < Math.fround(SPAWN_SHAPE_PROFILE.minAspect) || shape.aspect > SPAWN_SHAPE_PROFILE.maxAspect ||
+      !Number.isInteger(shape.kind) || shape.kind < 0 || shape.kind > 2) {
+    throw new RangeError('A finite, bounded spawn shape is required.');
+  }
+}
+
+export function spawnShapePoint(x, y, shape) {
+  validateSpawnShape(shape);
+  if (![x, y].every(Number.isFinite)) throw new RangeError('Finite spawn-local coordinates are required.');
+  const c = Math.cos(shape.angle), s = Math.sin(shape.angle);
+  const qx = c * x + s * y, qy = (-s * x + c * y) / shape.aspect;
+  if (qx * qx + qy * qy < 1e-10) return { x: qx, y: qy };
+  const theta = Math.atan2(qy, qx);
+  const a = shape.kind === 1 ? .10 : .015;
+  const b = shape.kind === 0 ? .035 : .055;
+  const d = shape.kind === 2 ? .10 : .025;
+  const radial = SPAWN_SHAPE_PROFILE.extent *
+    (1 + a * Math.cos(theta + shape.phase) + b * Math.cos(2 * theta - shape.phase) +
+      d * Math.sin(3 * theta + 2 * shape.phase)) / (1 + a + b + d);
+  return { x: qx / radial, y: qy / radial };
+}
+
+export function creamPrimitiveDistance(primitive, point) {
+  if (!primitive.spawnShape) return Math.hypot(point.x - primitive.x, point.y - primitive.y) - primitive.radius;
+  const q = spawnShapePoint((point.x - primitive.x) / primitive.radius, (point.y - primitive.y) / primitive.radius, primitive.spawnShape);
+  return (Math.hypot(q.x, q.y) - 1) * primitive.radius;
 }
 
 function validateSpawn(spawn) {
@@ -120,13 +285,16 @@ function validateSpawn(spawn) {
       spawn.x < 0 || spawn.x > 1 || spawn.y < 0 || spawn.y > 1 || spawn.born < 0) {
     throw new RangeError('A positive spawn identity, normalized position and nonnegative birth time are required.');
   }
+  if (spawn.shape !== undefined) validateSpawnShape(spawn.shape);
 }
 
-export function appendCreamSpawn(spawns, spawn) {
+export function appendCreamSpawn(spawns, spawn, seed = 0) {
   if (!Array.isArray(spawns) || spawns.length > CREAM_MAX_SPAWNS) throw new RangeError('A bounded spawn queue is required.');
   spawns.forEach(validateSpawn);
   validateSpawn(spawn);
-  return Object.freeze([...spawns.slice(-(CREAM_MAX_SPAWNS - 1)), Object.freeze({ ...spawn })]);
+  const shape = spawn.shape ?? createSpawnShape(seed, spawn.id);
+  return Object.freeze([...spawns.slice(-(CREAM_MAX_SPAWNS - 1)),
+    Object.freeze({ ...spawn, shape: Object.freeze({ ...shape }) })]);
 }
 
 export function sampleProductionTrail(model, trail, cursor) {
@@ -138,7 +306,7 @@ export function sampleProductionTrail(model, trail, cursor) {
 
 function ambientDistance(model, primitives, point, blend) {
   let distance = 100000;
-  for (const p of primitives) distance = model.smoothUnion(distance, Math.hypot(point.x-p.x, point.y-p.y)-p.radius, blend);
+  for (const p of primitives) distance = model.smoothUnion(distance, creamPrimitiveDistance(p, point), blend);
   return distance;
 }
 
@@ -311,6 +479,12 @@ export function creamModuleUrl(path, base = import.meta.url) {
   return url.href;
 }
 
+class CreamContextLostError extends Error {
+  constructor(cause) {
+    super('Cream graphics context was lost.', { cause });
+  }
+}
+
 function createRenderer(canvas, pointerCanvas, model, sources) {
   const gl = canvas.getContext('webgl2', {
     alpha: true, premultipliedAlpha: true, antialias: true, depth: false,
@@ -341,7 +515,7 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
     gl.attachShader(program, shader);
   };
   try {
-    for (const [index, fragment] of [sources.fragment, sources.strawberryFragment, sources.contactFragment].entries()) {
+    for (const [index, fragment] of [sources.fragment, sources.spawnFragment, sources.contactFragment, sources.spawnContactFragment].entries()) {
       program = gl.createProgram();
       if (!program) throw new Error('Cream program allocation failed.');
       programs.push(program);
@@ -358,12 +532,14 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
       const names = ['resolution', 'pixelRatio', 'viewSize', 'scoopCount', 'scoops',
         'trail', 'trailCount', 'headRadius', 'cursorTint', 'cursorShape'];
       if (index >= 1) names.push('strawberryStart');
-      if (index === 2) names.push('ambientCount', 'contactActive', 'contactPass', 'contactTrailCount', 'contactShape');
+      if (index >= 2) names.push('ambientCount', 'contactActive', 'contactPass', 'contactTrailCount', 'contactShape');
+      if (index === 1 || index === 3) names.push('spawnShapeCount', 'spawnShapes');
       uniforms = Object.fromEntries(names.map(name =>
-        [name, gl.getUniformLocation(program, ['scoops', 'trail'].includes(name) ? `${name}[0]` : name)]));
+        [name, gl.getUniformLocation(program, ['scoops', 'trail', 'spawnShapes'].includes(name) ? `${name}[0]` : name)]));
       if (Object.values(uniforms).some(value => value === null)) throw new Error('Cream material uniforms are unavailable.');
       materials.push({ program, position, uniforms: { ambientCount: null, contactActive: null,
-        contactPass: null, contactTrailCount: null, contactShape: null, strawberryStart: null, ...uniforms } });
+        contactPass: null, contactTrailCount: null, contactShape: null, strawberryStart: null,
+        spawnShapeCount: null, spawnShapes: null, ...uniforms } });
     }
     geometry = gl.createBuffer();
     if (!geometry) throw new Error('Cream geometry allocation failed.');
@@ -376,18 +552,20 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
     viewport = Array.from(gl.getParameter(gl.MAX_VIEWPORT_DIMS));
     if (gl.getError() !== gl.NO_ERROR) throw new Error('Cream graphics setup failed.');
   } catch (error) {
+    const contextLost = gl.isContextLost();
     dispose();
-    throw error;
+    throw contextLost ? new CreamContextLostError(error) : error;
   }
   const data = new Float32Array(CREAM_MAX_PRIMITIVES * 4);
   const pointerData = new Float32Array(CREAM_MAX_PRIMITIVES * 4);
   const contactData = new Float32Array(CREAM_MAX_PRIMITIVES * 4);
   const trailData = new Float32Array(model.TRAIL_PROFILE.links * 4);
+  const spawnShapeData = new Float32Array(CREAM_MAX_SPAWNS * 4);
   return {
     dispose,
     outputSize(width, height, ratio) { return creamOutputSize(width, height, ratio, limit, viewport); },
     draw({ width, height, output, primitives, strawberryStart, cursor, shape, trail, pointerActive }) {
-      if (gl.isContextLost()) throw new Error('Cream graphics context was lost during rendering.');
+      if (gl.isContextLost()) throw new CreamContextLostError();
       gl.viewport(0, 0, canvas.width, canvas.height);
       const radius = model.cursorRadius(width, height), path = sampleProductionTrail(model, trail, cursor);
       const canPaintPointer = pointerActive && pointerContext && !pointerContext.isContextLost?.();
@@ -397,6 +575,14 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
       if (count > CREAM_MAX_PRIMITIVES) throw new Error('Cream contact exceeds primitive capacity.');
       data.fill(0);
       primitives.forEach((scoop, index) => data.set([scoop.x, scoop.y, scoop.radius, scoop.peak], index * 4));
+      const spawnCount = strawberryStart < 0 ? 0 : primitives.length - strawberryStart;
+      if (spawnCount > CREAM_MAX_SPAWNS) throw new Error('Cream spawn shapes exceed capacity.');
+      spawnShapeData.fill(0);
+      for (let i = 0; i < spawnCount; i++) {
+        const shape = primitives[strawberryStart + i].spawnShape;
+        validateSpawnShape(shape);
+        spawnShapeData.set([shape.angle, shape.aspect, shape.phase, shape.kind], i * 4);
+      }
       if (contact.active) {
         contactData.set(data);
         contactData.set([cursor.x, cursor.y, radius, 0], primitives.length * 4);
@@ -422,11 +608,13 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
         gl.uniform2f(uniforms.viewSize, width, height);
         gl.uniform4fv(uniforms.trail, trailData);
         gl.uniform1f(uniforms.headRadius, radius);
+        gl.uniform1i(uniforms.spawnShapeCount, spawnCount);
+        gl.uniform4fv(uniforms.spawnShapes, spawnShapeData);
       };
       const margin = radius * CURSOR_SHAPE_PROFILE.maxExtent + 14 + Math.min(width, height) * .04 +
         (contact.active ? Math.min(width, height)*.034 + 4 : 0);
       if (canPaintPointer) {
-        select(contact.active ? 2 : 0);
+        select(contact.active ? (spawnCount ? 3 : 2) : 0);
         const points = [cursor, ...path];
         const left = Math.max(0, Math.floor((Math.min(...points.map(point => point.x)) - margin) * output.ratio));
         const top = Math.max(0, Math.floor((Math.min(...points.map(point => point.y)) - margin) * output.ratio));
@@ -468,7 +656,7 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
           }
         }
       }
-      select(contact.active ? 2 : strawberryStart >= 0 ? 1 : 0);
+      select(contact.active ? (spawnCount ? 3 : 2) : strawberryStart >= 0 ? 1 : 0);
       gl.uniform1i(uniforms.scoopCount, count);
       gl.uniform4fv(uniforms.scoops, contact.active ? contactData : data);
       gl.uniform1i(uniforms.trailCount, 0);
@@ -482,6 +670,7 @@ function createRenderer(canvas, pointerCanvas, model, sources) {
       if (contact.active) gl.uniform4f(uniforms.contactShape, shape.angle, shape.stretch, shape.phase, shape.energy);
       gl.disable(gl.SCISSOR_TEST);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+      if (gl.isContextLost()) throw new CreamContextLostError();
       if (gl.getError() !== gl.NO_ERROR) throw new Error('Cream material rendering failed.');
       return { pointerPainted, segments, radius, contact, primitiveCount: count, margin };
     },
@@ -552,12 +741,21 @@ async function initialize(layer, model) {
     setData({ state: reason, paused, contactActive: false, contactHead: false, contactTrail: false });
   };
   const fail = error => {
+    if (error instanceof CreamContextLostError) { loseGraphics(); return; }
     failed = true;
     hide('failed');
     renderer?.dispose();
     renderer = undefined;
     setData({ error: error instanceof Error ? error.message : String(error) });
     console.warn('The optional cream effect is unavailable; the normal website remains usable.', error);
+  };
+  const loseGraphics = () => {
+    lost = true;
+    hide('context-lost');
+    renderer?.dispose();
+    renderer = undefined;
+    output = undefined;
+    dirty = true;
   };
   const entranceVisible = () => !!entrance && !entrance.hidden &&
     getComputedStyle(entrance).display !== 'none' && getComputedStyle(entrance).visibility !== 'hidden';
@@ -732,8 +930,11 @@ async function initialize(layer, model) {
       scoopCount: recipe.clumps.length, seedCount: recipe.clumps.length,
       capacity: CREAM_MAX_PRIMITIVES, primitiveCapacity: CREAM_MAX_PRIMITIVES,
       logicalCapacity: CREAM_MAX_GROUPS + CREAM_MAX_DROPLETS + CREAM_MAX_SPAWNS,
-      geometryMultiplier: CREAM_GEOMETRY_MULTIPLIER, trailLengthScale: CREAM_TRAIL_LENGTH,
-      spawnCapacity: CREAM_MAX_SPAWNS, spawnBaseRadiusFraction: CREAM_SPAWN_BASE_RADIUS });
+      geometryMultiplier: CREAM_GEOMETRY_MULTIPLIER, groupGeometryMultiplier: GROUP_GEOMETRY_MULTIPLIER,
+      largeGroupGeometryMultiplier: LARGE_GROUP_GEOMETRY_MULTIPLIER,
+      groupMotionMode: 'repel-attract', groupMotionCycles: GROUP_MOTION_PROFILE.cycles, trailLengthScale: CREAM_TRAIL_LENGTH,
+      spawnCapacity: CREAM_MAX_SPAWNS, spawnBaseRadiusFraction: CREAM_SPAWN_BASE_RADIUS,
+      spawnGeometryMultiplier: SPAWN_GEOMETRY_MULTIPLIER, spawnShapeExtent: SPAWN_SHAPE_PROFILE.extent });
     button.setAttribute('aria-keyshortcuts', 'Alt+Shift+P');
     button.setAttribute('title', 'Pause or resume cream motion (Alt+Shift+P)');
     on(button, 'click', togglePause);
@@ -784,7 +985,7 @@ async function initialize(layer, model) {
       if (!renderer || !lifecycle().animate || viewerOpen() || !creamClickAllowed(event, candidate, performance.now())) return;
       if (event.clientX < 0 || event.clientY < 0 || event.clientX >= innerWidth || event.clientY >= innerHeight) return;
       spawns = appendCreamSpawn(spawns, { id: ++spawnSequence, x: event.clientX / innerWidth,
-        y: event.clientY / innerHeight, born: creamSampleTime(motionTime) });
+        y: event.clientY / innerHeight, born: creamSampleTime(motionTime) }, recipe.seed);
       // A normal animation frame paints the queue; a synchronous inactive repaint would erase the follower.
       schedule();
     }, { passive: true });
@@ -806,12 +1007,7 @@ async function initialize(layer, model) {
     });
     on(canvas, 'webglcontextlost', event => {
       event.preventDefault();
-      lost = true;
-      hide('context-lost');
-      renderer?.dispose();
-      renderer = undefined;
-      output = undefined;
-      dirty = true;
+      loseGraphics();
     });
     on(canvas, 'webglcontextrestored', () => {
       if (failed || disposed) return;
